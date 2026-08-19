@@ -3,6 +3,7 @@ package fabric
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -21,6 +22,9 @@ func (RandomSource) NextCell(context.Context) (Cell, error) { return RandomCell(
 type Config struct {
 	Epoch         time.Duration
 	CellsPerEpoch int
+	// MaxLateness is a public operational limit. The scheduler fails instead of
+	// emitting a catch-up burst after this limit is exceeded.
+	MaxLateness time.Duration
 }
 
 func (c Config) Validate() error {
@@ -35,6 +39,9 @@ func (c Config) Validate() error {
 	}
 	if c.Epoch%time.Duration(c.CellsPerEpoch) != 0 {
 		return errors.New("epoch must divide exactly into equal cell intervals")
+	}
+	if c.MaxLateness < 0 {
+		return errors.New("maximum lateness must not be negative")
 	}
 	return nil
 }
@@ -57,6 +64,8 @@ type Scheduler struct {
 	sink   Sink
 }
 
+var ErrDeadlineMissed = errors.New("fixed-cadence deadline missed")
+
 func NewScheduler(cfg Config, source Source, sink Sink) (*Scheduler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -77,30 +86,61 @@ func (s *Scheduler) EmitOne(ctx context.Context) error {
 	return s.sink.Send(ctx, cell)
 }
 
-// EmitEpoch emits one epoch's worth of cells without delays. It is a test and
-// batch-processing helper; Run is the method that enforces wall-clock spacing.
-func (s *Scheduler) EmitEpoch(ctx context.Context) error {
-	for i := 0; i < s.cfg.CellsPerEpoch; i++ {
+// Run emits one cell per CellInterval until the context ends. Deadlines are
+// absolute, not delays after Send, so sink latency cannot accumulate as drift.
+// A missed slot is never followed by a catch-up burst.
+func (s *Scheduler) Run(ctx context.Context) error {
+	return s.run(ctx, -1)
+}
+
+// RunCells is the finite form used by the testnet and black-box UDP tests.
+func (s *Scheduler) RunCells(ctx context.Context, count int) error {
+	if count < 0 {
+		return errors.New("cell count must not be negative")
+	}
+	return s.run(ctx, count)
+}
+
+func (s *Scheduler) run(ctx context.Context, count int) error {
+	if count == 0 {
+		return nil
+	}
+	interval := s.cfg.CellInterval()
+	allowed := s.cfg.MaxLateness
+	if allowed == 0 {
+		allowed = interval
+	}
+	next := time.Now().Add(interval)
+	for emitted := 0; count < 0 || emitted < count; emitted++ {
+		if err := waitUntil(ctx, next); err != nil {
+			return err
+		}
+		if late := time.Since(next); late > allowed {
+			return fmt.Errorf("%w by %s", ErrDeadlineMissed, late)
+		}
 		if err := s.EmitOne(ctx); err != nil {
 			return err
+		}
+		next = next.Add(interval)
+		if !time.Now().Before(next) {
+			return ErrDeadlineMissed
 		}
 	}
 	return nil
 }
 
-// Run emits one cell per CellInterval. No application/read state is consulted.
-func (s *Scheduler) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.CellInterval())
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := s.EmitOne(ctx); err != nil {
-				return err
-			}
-		}
+func waitUntil(ctx context.Context, deadline time.Time) error {
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
