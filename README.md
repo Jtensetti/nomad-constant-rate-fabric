@@ -1,35 +1,25 @@
 # nomad-constant-rate-fabric
 
-Research implementation of Nomad's **activity-independent traffic shaper**.
+A small Go traffic-shaping experiment for Nomad's fixed-size, fixed-cadence cell stream.
 
-The package emits a protocol-defined number of fixed-size cells per time slice. Local user activity is intentionally absent from the scheduler API. This makes the principal invariant testable:
+`Run` emits **one 1200-byte cell per configured cell interval**. Earlier versions of this repository emitted an epoch's cells as a burst and therefore did not implement constant-rate timing; that behavior has been removed from the wall-clock path.
 
-> The externally observable traffic shape must not depend on whether the local user is idle, reading, searching, or reconstructing content.
+## Implemented
 
-## What is implemented
+- fixed 1200-byte cells,
+- cryptographically random filler source,
+- one-cell-at-a-time wall-clock scheduler,
+- explicit traffic-class accounting epochs,
+- deterministic source/sink execution helpers for tests.
 
-- Fixed 1200-byte cells.
-- Deterministic traffic-trace model.
-- Wall-clock scheduler for local experiments.
-- Cryptographically random utility cells.
-- Tests asserting invariant traffic shape.
-- CSV trace generator.
+`EmitEpoch` deliberately skips delays and exists only for tests/batch processing. It must not be used as evidence of wire-level constant-rate behavior.
 
-## What this is not
+## Not implemented
 
-This repository is a research component, not an audited anonymity transport and not a public-network deployment tool. It deliberately omits peer discovery, NAT traversal, Internet routing and deployment automation.
-
-## Build and test
+There is no UDP transport, congestion response, NAT traversal, peer discovery, kernel scheduling control or packet-capture validation here. OS scheduling jitter can still change real packet timing. Wire-level claims belong in `nomad-testnet` and must be based on packet captures, not this package's planned trace.
 
 ```bash
-go test ./...
 go test -race ./...
 go vet ./...
-go run ./cmd/fabric-sim -ticks 1000 -cells 16 > trace.csv
+go run ./cmd/fabric-sim -epochs 1000 -cells 16 -epoch 100ms > trace.csv
 ```
-
-## Security invariant
-
-`Scheduler` has no reference to local selection state. If future code adds such a dependency, treat that as a security regression.
-
-See the architecture repository for the complete threat model and cross-component invariants.

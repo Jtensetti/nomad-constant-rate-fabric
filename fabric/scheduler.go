@@ -6,43 +6,51 @@ import (
 	"time"
 )
 
-// Source provides the next payload cell. The scheduler never receives user
-// activity state, which is an intentional Selection Firewall boundary.
+// Source supplies one complete fixed-size cell. Choosing what protocol work
+// fills a cell is intentionally separate from the wall-clock scheduler.
 type Source interface {
 	NextCell(context.Context) (Cell, error)
 }
 
-// RandomSource produces utility/cover cells when no other protocol work is available.
 type RandomSource struct{}
 
-func (RandomSource) NextCell(context.Context) (Cell, error) {
-	var c Cell
-	return c, FillRandom(&c)
-}
+func (RandomSource) NextCell(context.Context) (Cell, error) { return RandomCell() }
 
-// Config fixes externally observable traffic shape.
+// Config describes a traffic class. Epoch is the accounting window; cells are
+// evenly spaced across that window by Run rather than emitted as an epoch burst.
 type Config struct {
-	Tick         time.Duration
-	CellsPerTick int
+	Epoch         time.Duration
+	CellsPerEpoch int
 }
 
 func (c Config) Validate() error {
-	if c.Tick <= 0 {
-		return errors.New("tick must be positive")
+	if c.Epoch <= 0 {
+		return errors.New("epoch must be positive")
 	}
-	if c.CellsPerTick <= 0 {
-		return errors.New("cells per tick must be positive")
+	if c.CellsPerEpoch <= 0 {
+		return errors.New("cells per epoch must be positive")
+	}
+	if c.CellInterval() <= 0 {
+		return errors.New("epoch is too short for the configured cell count")
+	}
+	if c.Epoch%time.Duration(c.CellsPerEpoch) != 0 {
+		return errors.New("epoch must divide exactly into equal cell intervals")
 	}
 	return nil
 }
 
-// Sink receives cells emitted at protocol-determined times.
+// CellInterval is the target spacing between externally visible cells.
+func (c Config) CellInterval() time.Duration {
+	if c.CellsPerEpoch <= 0 {
+		return 0
+	}
+	return c.Epoch / time.Duration(c.CellsPerEpoch)
+}
+
 type Sink interface {
 	Send(context.Context, Cell) error
 }
 
-// Scheduler emits exactly CellsPerTick cells every Tick. It has deliberately
-// no API for application demand or local selection state.
 type Scheduler struct {
 	cfg    Config
 	source Source
@@ -59,38 +67,55 @@ func NewScheduler(cfg Config, source Source, sink Sink) (*Scheduler, error) {
 	return &Scheduler{cfg: cfg, source: source, sink: sink}, nil
 }
 
+// EmitOne executes one scheduled emission. It exists so the actual source/sink
+// path can be exercised without wall-clock sleeps in unit tests.
+func (s *Scheduler) EmitOne(ctx context.Context) error {
+	cell, err := s.source.NextCell(ctx)
+	if err != nil {
+		return err
+	}
+	return s.sink.Send(ctx, cell)
+}
+
+// EmitEpoch emits one epoch's worth of cells without delays. It is a test and
+// batch-processing helper; Run is the method that enforces wall-clock spacing.
+func (s *Scheduler) EmitEpoch(ctx context.Context) error {
+	for i := 0; i < s.cfg.CellsPerEpoch; i++ {
+		if err := s.EmitOne(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Run emits one cell per CellInterval. No application/read state is consulted.
 func (s *Scheduler) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.Tick)
+	ticker := time.NewTicker(s.cfg.CellInterval())
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			for i := 0; i < s.cfg.CellsPerTick; i++ {
-				c, err := s.source.NextCell(ctx)
-				if err != nil {
-					return err
-				}
-				if err := s.sink.Send(ctx, c); err != nil {
-					return err
-				}
+			if err := s.EmitOne(ctx); err != nil {
+				return err
 			}
 		}
 	}
 }
 
-// Trace deterministically describes observable traffic without running a wall clock.
-func Trace(cfg Config, ticks int) ([]int, error) {
+// EpochTrace returns the planned byte count per accounting epoch. It is a
+// planning helper, not a packet capture or timing measurement.
+func EpochTrace(cfg Config, epochs int) ([]int, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if ticks < 0 {
-		return nil, errors.New("ticks must be non-negative")
+	if epochs < 0 {
+		return nil, errors.New("epochs must be non-negative")
 	}
-	out := make([]int, ticks)
+	out := make([]int, epochs)
 	for i := range out {
-		out[i] = cfg.CellsPerTick * CellSize
+		out[i] = cfg.CellsPerEpoch * CellSize
 	}
 	return out, nil
 }
