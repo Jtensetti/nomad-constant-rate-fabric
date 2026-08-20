@@ -88,3 +88,32 @@ func TestQueueSourceConcurrentProducerConsumerPreservesOrder(t *testing.T) {
 	}
 	<-done
 }
+
+func TestQueueSourceReservedProducerNeverBlocksConsumer(t *testing.T) {
+	queue, err := NewQueueSource(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reserve FIFO position zero exactly as Enqueue does, but intentionally do
+	// not publish it yet. This models a producer being descheduled while copying
+	// a cell. A deadline-path consumer must return ErrNoWork rather than wait.
+	if !queue.enqueue.CompareAndSwap(0, 1) {
+		t.Fatal("could not reserve first producer position")
+	}
+	if !queue.Enqueue(numberedCell(2)) {
+		t.Fatal("second producer could not publish its bounded position")
+	}
+	if _, err := queue.NextCell(context.Background()); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("consumer crossed an unpublished FIFO position: %v", err)
+	}
+
+	queue.slots[0].cell = numberedCell(1)
+	queue.slots[0].published.Store(1)
+	for _, want := range []uint64{1, 2} {
+		cell, err := queue.NextCell(context.Background())
+		if err != nil || cellNumber(cell) != want {
+			t.Fatalf("after publish got %d, %v; want %d", cellNumber(cell), err, want)
+		}
+	}
+}
